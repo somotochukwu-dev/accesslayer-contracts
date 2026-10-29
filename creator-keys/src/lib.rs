@@ -84,6 +84,7 @@ pub mod protocol_governance;
 pub mod proxy;
 pub mod ratings_royalties_dividends;
 pub mod supply_milestones;
+pub mod timed_pause;
 pub use proxy::{BondingCurveProxy, BondingCurveProxyClient};
 pub mod vote_delegation;
 pub use vote_delegation::VoteDelegationKey;
@@ -373,11 +374,13 @@ pub enum ContractError {
     /// The key is not frozen, so there is nothing to unfreeze.
     KeyNotFrozen = 141,
     /// Trading for the creator key is suspended by its circuit breaker.
-    CircuitBreakerActive = 142,
+    CircuitBreakerActive = 148,
     /// A passed governance proposal could not complete its bond action.
     BondExecutionFailed = 149,
     /// Trading is disabled until the creator escrows the required performance bond.
     PerformanceBondRequired = 150,
+    /// An admin's bounded platform halt is active; query `get_platform_pause` for context.
+    PlatformPaused = 151,
 }
 
 impl ContractError {
@@ -437,6 +440,10 @@ pub enum FeatureError {
     InvalidAuctionConfig = 6,
     /// `cancel_auction` or `buy_key` (auction path) but no auction is configured.
     NoAuctionConfigured = 7,
+    /// A one-time key configuration has already been stored.
+    AlreadyConfigured = 8,
+    /// Supply slope tiers are empty, too numerous, unsorted, or negative.
+    InvalidCurveMilestones = 9,
 }
 
 /// Errors raised by the buy-cooldown entrypoints
@@ -2357,6 +2364,8 @@ pub enum FeatureKey {
     BondSlashed(Address),
     /// (creator) -> cumulative released bond amount in stroops.
     BondReleased(Address),
+    /// (creator) -> immutable supply-triggered curve-slope milestone config.
+    CurveSlopeMilestones(Address),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4020,12 +4029,12 @@ fn read_required_effective_fee_config(env: &Env) -> Result<fee::FeeConfig, Contr
 
 /// Resolves the curve slope that applies to `creator`.
 ///
-/// A creator that has been through [`CreatorKeysContract::reset_curve`] carries a
-/// per-creator slope override, which takes precedence over the global slope. Every
-/// other creator inherits the global slope, so resetting one creator cannot move
-/// another creator's pricing.
-fn resolve_curve_slope(env: &Env, creator: &Address) -> i128 {
-    read_creator_slope(env, creator).unwrap_or_else(|| read_curve_slope(env))
+/// A reached supply milestone takes precedence over the creator's reset override;
+/// otherwise the reset override takes precedence over the protocol-wide slope.
+pub(crate) fn resolve_curve_slope(env: &Env, creator: &Address) -> i128 {
+    supply_milestones::curve_slope_override(env, creator)
+        .or_else(|| read_creator_slope(env, creator))
+        .unwrap_or_else(|| read_curve_slope(env))
 }
 
 fn read_protocol_fee_config(env: &Env) -> Option<fee::FeeConfig> {
@@ -7259,6 +7268,7 @@ impl CreatorKeysContract {
             emit_milestone_crossings(&env, &creator, profile.supply - 1, profile.supply)?;
             // Apply any newly reached graduated supply milestone (fee reduction).
             supply_milestones::check_and_apply_milestone(&env, &creator)?;
+            supply_milestones::check_and_apply_curve_slope_milestone(&env, &creator)?;
 
             // Record the key creation ledger on the first buy for launch penalty tracking.
             if profile.supply == 1 {
@@ -7846,6 +7856,7 @@ impl CreatorKeysContract {
         emit_milestone_crossings(&env, &creator, profile.supply - 1, profile.supply)?;
         // Apply any newly reached graduated supply milestone (fee reduction).
         supply_milestones::check_and_apply_milestone(&env, &creator)?;
+        supply_milestones::check_and_apply_curve_slope_milestone(&env, &creator)?;
 
         // Record the key creation ledger on the first buy for launch penalty tracking.
         if profile.supply == 1 {
@@ -8235,6 +8246,7 @@ impl CreatorKeysContract {
         write_creator_supply(&env, &creator, profile.supply);
         // Apply any newly reached graduated supply milestone (fee reduction).
         supply_milestones::check_and_apply_milestone(&env, &creator)?;
+        supply_milestones::check_and_apply_curve_slope_milestone(&env, &creator)?;
         if new_balance == 0 {
             env.storage().persistent().remove(&balance_key);
             env.storage()
@@ -9523,6 +9535,24 @@ impl CreatorKeysContract {
     /// tiers reached) and the fee bps currently in effect for `key_id`.
     pub fn get_current_milestone(env: Env, key_id: Address) -> Result<(u32, u32), ContractError> {
         supply_milestones::get_current_milestone(&env, &key_id)
+    }
+
+    /// Configure the immutable bonding-curve slope schedule for a key.
+    pub fn set_curve_slope_milestones(
+        env: Env,
+        admin: Address,
+        key_id: Address,
+        tiers: Vec<supply_milestones::CurveSlopeTier>,
+    ) -> Result<(), FeatureError> {
+        supply_milestones::set_curve_slope_milestones(&env, &admin, &key_id, tiers)
+    }
+
+    /// Read the active slope milestone index and effective per-key curve slope.
+    pub fn current_curve_slope_milestone(
+        env: Env,
+        key_id: Address,
+    ) -> Result<(u32, i128), ContractError> {
+        supply_milestones::get_current_curve_slope_milestone(&env, &key_id)
     }
 
     /// Stages a timelocked upgrade of the contract's logic build and returns the
@@ -13084,6 +13114,8 @@ impl CreatorKeysContract {
         direction: SwapDirection,
         max_slippage_bps: u32,
     ) -> Result<i128, ContractError> {
+        timed_pause::assert_not_paused(&env)?;
+        assert_not_paused(&env)?;
         if amount == 0 {
             return Err(ContractError::NotPositiveAmount);
         }

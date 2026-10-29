@@ -1,15 +1,15 @@
-//! Graduated supply milestones with automatic per-key fee reduction.
+//! Graduated supply milestones with fee reduction and curve-slope updates.
 //!
 //! Tracks bonding-curve graduation thresholds per key and automatically lowers
 //! the key's fee once its circulating supply crosses configured milestones.
-//! Milestones are applied in ascending supply order and the fee never regresses
-//! to a higher value once a lower tier has been reached.
+//! Slope milestones also apply a one-time schedule of per-key curve coefficients.
+//! Milestones are applied in ascending supply order and never regress.
 
 use crate::{
     assert_is_admin, extend_key_ttl_to_full_window, read_creator_supply,
-    read_registered_creator_profile, ContractError, DataKey,
+    read_registered_creator_profile, ContractError, DataKey, FeatureError, FeatureKey,
 };
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 /// Maximum number of milestone tiers that can be configured for a single key.
 pub const MAX_MILESTONE_TIERS: u32 = 5;
@@ -40,9 +40,154 @@ pub struct MilestoneConfig {
     pub current_fee_bps: u32,
 }
 
+/// A supply threshold and the curve slope that becomes active at that threshold.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct CurveSlopeTier {
+    pub supply: u32,
+    pub slope: i128,
+}
+
+/// Per-key immutable slope schedule and its monotonic activation state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct CurveSlopeConfig {
+    pub tiers: Vec<CurveSlopeTier>,
+    pub applied_count: u32,
+    pub current_slope: Option<i128>,
+}
+
+/// Event payload published when a supply threshold activates a curve slope.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SupplyMilestoneUnlockedEvent {
+    pub milestone_index: u32,
+    pub supply: u32,
+    pub new_slope: i128,
+}
+
 /// Storage key for a key's milestone configuration.
 fn storage_key(key_id: &Address) -> DataKey {
     DataKey::KeyMilestones(key_id.clone())
+}
+
+fn curve_slope_storage_key(key_id: &Address) -> FeatureKey {
+    FeatureKey::CurveSlopeMilestones(key_id.clone())
+}
+
+/// Configure a one-time per-key curve slope schedule.
+pub fn set_curve_slope_milestones(
+    env: &Env,
+    admin: &Address,
+    key_id: &Address,
+    tiers: Vec<CurveSlopeTier>,
+) -> Result<(), FeatureError> {
+    admin.require_auth();
+    assert_is_admin(env, admin).map_err(|_| FeatureError::Unauthorized)?;
+    read_registered_creator_profile(env, key_id).map_err(|_| FeatureError::NotRegistered)?;
+
+    let key = curve_slope_storage_key(key_id);
+    if env.storage().persistent().has(&key) {
+        return Err(FeatureError::AlreadyConfigured);
+    }
+    if tiers.is_empty() || tiers.len() > MAX_MILESTONE_TIERS {
+        return Err(FeatureError::InvalidCurveMilestones);
+    }
+
+    let mut previous_supply = 0;
+    for tier in tiers.iter() {
+        if tier.supply == 0 || tier.supply <= previous_supply || tier.slope < 0 {
+            return Err(FeatureError::InvalidCurveMilestones);
+        }
+        previous_supply = tier.supply;
+    }
+
+    env.storage().persistent().set(
+        &key,
+        &CurveSlopeConfig {
+            tiers,
+            applied_count: 0,
+            current_slope: None,
+        },
+    );
+    extend_key_ttl_to_full_window(env, &key);
+    Ok(())
+}
+
+/// Activate each newly crossed slope tier. Multiple thresholds crossed in one
+/// mint are applied and emitted once, in ascending threshold order.
+pub fn check_and_apply_curve_slope_milestone(
+    env: &Env,
+    key_id: &Address,
+) -> Result<(u32, i128), ContractError> {
+    let key = curve_slope_storage_key(key_id);
+    let Some(mut config) = env
+        .storage()
+        .persistent()
+        .get::<FeatureKey, CurveSlopeConfig>(&key)
+    else {
+        return Ok((0, crate::resolve_curve_slope(env, key_id)));
+    };
+    let supply = read_creator_supply(env, key_id);
+    let old_count = config.applied_count;
+
+    while config.applied_count < config.tiers.len() {
+        let tier = config.tiers.get(config.applied_count).unwrap();
+        if tier.supply > supply {
+            break;
+        }
+
+        config.applied_count += 1;
+        config.current_slope = Some(tier.slope);
+        env.events().publish(
+            (Symbol::new(env, "SupplyMilestoneUnlocked"), key_id.clone()),
+            SupplyMilestoneUnlockedEvent {
+                milestone_index: config.applied_count,
+                supply,
+                new_slope: tier.slope,
+            },
+        );
+    }
+
+    if config.applied_count != old_count {
+        env.storage().persistent().set(&key, &config);
+        extend_key_ttl_to_full_window(env, &key);
+    }
+
+    let slope = config
+        .current_slope
+        .unwrap_or_else(|| crate::resolve_curve_slope(env, key_id));
+    Ok((config.applied_count, slope))
+}
+
+/// Return the active one-based tier and effective slope (zero tier before the
+/// first threshold or when no schedule is configured).
+pub fn get_current_curve_slope_milestone(
+    env: &Env,
+    key_id: &Address,
+) -> Result<(u32, i128), ContractError> {
+    read_registered_creator_profile(env, key_id)?;
+    let config: Option<CurveSlopeConfig> = env
+        .storage()
+        .persistent()
+        .get(&curve_slope_storage_key(key_id));
+    Ok(match config {
+        Some(config) => {
+            let slope = config
+                .current_slope
+                .unwrap_or_else(|| crate::resolve_curve_slope(env, key_id));
+            (config.applied_count, slope)
+        }
+        None => (0, crate::resolve_curve_slope(env, key_id)),
+    })
+}
+
+/// Active milestone slope, when a configured threshold has been crossed.
+pub(crate) fn curve_slope_override(env: &Env, key_id: &Address) -> Option<i128> {
+    env.storage()
+        .persistent()
+        .get::<FeatureKey, CurveSlopeConfig>(&curve_slope_storage_key(key_id))
+        .and_then(|config| config.current_slope)
 }
 
 /// Configure the graduated milestone tiers for a key.
